@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 from sklearn.model_selection import GroupKFold
 from sklearn.compose import ColumnTransformer
@@ -33,7 +34,7 @@ st.set_page_config(
 def load_and_prepare_base():
     df = pd.read_excel(BASE_FILE)
 
-    # Ingeniería de variables (igual que en Colab)
+    # Ingeniería de variables
     df["SEGMENTO_GEOGRAFICO"] = np.where(
         df["LOCALIDAD"].notna(),
         df["MUNI"].astype(str) + " - " + df["LOCALIDAD"].astype(str),
@@ -92,7 +93,6 @@ def load_and_prepare_base():
         df["PROM. PUNTAJE GLOBAL"] - df["PROM_PUNTAJE_PROMEDIO_AREAS"]
     )
 
-    # Guardamos cosas útiles en un dict
     meta = {
         "orden_icfes": orden_icfes,
         "umbral_nuevo": umbral_nuevo,
@@ -107,13 +107,40 @@ orden_icfes = meta["orden_icfes"]
 umbral_nuevo = meta["umbral_nuevo"]
 educativas_base = meta["educativas_base"]
 
+# Detectar posibles columnas de nombre y DANE en la base
+def detectar_nombre_y_dane(df):
+    name_candidates = [
+        "NOMBRE_COLEGIO",
+        "NOMBRE COLEGIO",
+        "NOMBRE_ESTABLECIMIENTO",
+        "NOMBRE ESTABLECIMIENTO",
+        "NOMBRE INSTITUCIÓN",
+        "NOMBRE_INSTITUCIÓN",
+        "COLEGIO",
+        "NOMBRE_SEDE",
+        "NOMBRE SEDE",
+    ]
+    dane_candidates = [
+        "COD_DANE",
+        "CODIGO_DANE",
+        "CÓDIGO_DANE",
+        "CODIGO DANE",
+        "DANE",
+        "DANE_SEDE",
+        "DANE ESTABLECIMIENTO",
+    ]
+    name_col = next((c for c in name_candidates if c in df.columns), None)
+    dane_col = next((c for c in dane_candidates if c in df.columns), None)
+    return name_col, dane_col
+
+NAME_COL, DANE_COL = detectar_nombre_y_dane(df_base)
+
 # ------------------------------------------------------------------
 # 2. Entrenar modelo de pensión (ensemble) con cache
 # ------------------------------------------------------------------
 @st.cache_resource
 def train_pension_model(df):
 
-    # Listas de variables (mismo criterio que en Colab)
     educativas = educativas_base + [
         "PROM_PUNTAJE_PROMEDIO_AREAS",
         "PROM_PUNTAJE_STEM",
@@ -151,12 +178,16 @@ def train_pension_model(df):
         categorical_features = geograficas + otras_categoricas
 
         numeric_transformer = Pipeline(
-            steps=[("imputer", SimpleImputer(strategy="median")),
-                   ("scaler", StandardScaler())]
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
         )
         categorical_transformer = Pipeline(
-            steps=[("imputer", SimpleImputer(strategy="most_frequent")),
-                   ("onehot", OneHotEncoder(handle_unknown="ignore"))]
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]
         )
 
         pre = ColumnTransformer(
@@ -225,8 +256,10 @@ def train_pension_model(df):
         groups = df["MUNI"]
         gkf = GroupKFold(n_splits=5)
 
-        metricas = {nombre: {"r2": [], "mae": [], "rmse": []}
-                    for nombre in nombres_modelos + ["ensemble"]}
+        metricas = {
+            nombre: {"r2": [], "mae": [], "rmse": []}
+            for nombre in nombres_modelos + ["ensemble"]
+        }
 
         for train_idx, val_idx in gkf.split(X_all, y_raw_all, groups):
             X_train = X_all.iloc[train_idx]
@@ -319,7 +352,7 @@ def train_pension_model(df):
     preds_log = []
     for _, pipe in modelos_pension.items():
         y_hat_tf = pipe.predict(X_all)
-        y_hat_log = y_hat_tf  # porque entrenamos en log
+        y_hat_log = y_hat_tf  # entrenamos en log
         preds_log.append(y_hat_log)
 
     y_hat_log_mean = np.column_stack(preds_log).mean(axis=1)
@@ -329,12 +362,12 @@ def train_pension_model(df):
     return modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension
 
 
-modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension = train_pension_model(
-    df_base
+modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension = (
+    train_pension_model(df_base)
 )
 
 # ------------------------------------------------------------------
-# 3. Funciones auxiliares de predicción y bandas
+# 3. Funciones auxiliares
 # ------------------------------------------------------------------
 def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
     df_nueva = df_nueva.copy()
@@ -439,6 +472,31 @@ def resumen_estudiantes_por_depto_y_pension(
         "df_filtrado": df_filtrado,
     }
 
+
+def chart_hist_with_line(series, value, title, x_label):
+    series = series.dropna()
+    if len(series) == 0 or value is None or np.isnan(value):
+        return None
+
+    data = pd.DataFrame({x_label: series})
+    hist = (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{x_label}:Q", bin=alt.Bin(maxbins=30)),
+            y="count()",
+        )
+    )
+
+    rule = (
+        alt.Chart(pd.DataFrame({x_label: [value]}))
+        .mark_rule(color="red", size=2)
+        .encode(x=f"{x_label}:Q")
+    )
+
+    return (hist + rule).properties(title=title, width=400, height=250)
+
+
 # ------------------------------------------------------------------
 # 4. Interfaz Streamlit
 # ------------------------------------------------------------------
@@ -449,11 +507,25 @@ def main():
         "estima cuántos estudiantes suelen tener colegios similares en el mismo municipio."
     )
 
+    # Selección de DEPTO y MUNI
     deptos = sorted(df_base["DEPTO"].dropna().unique())
     depto_sel = st.selectbox("Departamento (DEPTO)", deptos)
 
     munis = sorted(df_base.loc[df_base["DEPTO"] == depto_sel, "MUNI"].dropna().unique())
     muni_sel = st.selectbox("Municipio (MUNI)", munis)
+
+    # Localidad dependiente de DEPTO + MUNI
+    localidades_muni = (
+        df_base.loc[
+            (df_base["DEPTO"] == depto_sel) & (df_base["MUNI"] == muni_sel),
+            "LOCALIDAD",
+        ]
+        .dropna()
+        .unique()
+    )
+    localidades_muni = sorted(localidades_muni)
+
+    st.subheader("Características del colegio")
 
     tipos_muni = sorted(df_base["TIPO DE MUNICIPIO"].dropna().unique())
     calendarios = sorted(df_base["CALENDARIO"].dropna().unique())
@@ -461,7 +533,6 @@ def main():
     jornadas = sorted(df_base["JORNADA"].dropna().unique())
     icfes_opts = ["A+", "A", "B", "C", "D"]
 
-    st.subheader("Características del colegio")
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -471,11 +542,13 @@ def main():
         jornada_sel = st.selectbox("Jornada", jornadas)
 
     with col2:
-        anos_oper = st.number_input("Años de operación",
-                                    min_value=0, max_value=50, value=5)
+        anos_oper = st.number_input(
+            "Años de operación", min_value=0, max_value=50, value=5
+        )
         icfes_sel = st.selectbox("Plantel ICFES 2024", icfes_opts)
-        inse = st.number_input("INSE",
-                               value=float(df_base["INSE"].mean(skipna=True)))
+        inse = st.number_input(
+            "INSE", value=float(df_base["INSE"].mean(skipna=True))
+        )
         nse_estab = st.number_input(
             "NSE establecimiento",
             value=float(df_base["NSE_ ESTABLECIMIENTO"].mean(skipna=True)),
@@ -491,9 +564,16 @@ def main():
             min_value=1.0,
             value=float(df_base["ESTUDIANTES_TOTALES_2023"].median(skipna=True)),
         )
-        localidad_sel = st.text_input(
-            "Localidad (opcional, solo grandes ciudades)", value=""
-        )
+
+        if len(localidades_muni) > 0:
+            opciones_loc = ["Sin localidad / NA"] + list(localidades_muni)
+            loc_sel = st.selectbox("Localidad", opciones_loc)
+            localidad_value = (
+                np.nan if loc_sel == "Sin localidad / NA" else loc_sel
+            )
+        else:
+            st.text("No hay información de localidad para este municipio.")
+            localidad_value = np.nan
 
     st.subheader("Resultados Saber 11 (promedios)")
     col4, col5, col6 = st.columns(3)
@@ -543,7 +623,7 @@ def main():
             {
                 "DEPTO": [depto_sel],
                 "MUNI": [muni_sel],
-                "LOCALIDAD": [localidad_sel if localidad_sel.strip() != "" else np.nan],
+                "LOCALIDAD": [localidad_value],
                 "TIPO DE MUNICIPIO": [tipo_muni_sel],
                 "CALENDARIO": [calendario_sel],
                 "ES_BILINGUE": [bilingue_sel],
@@ -600,23 +680,75 @@ def main():
                 f"{info['prom_est_muni_banda']:.1f}",
             )
 
+        # Distribución de pensión en el municipio
+        st.markdown("### Distribuciones")
+        col_hist1, col_hist2 = st.columns(2)
+
+        pensiones_muni = df_base.loc[
+            df_base["MUNI"] == muni_sel, "PENSIÓN"
+        ]
+        chart_pension = chart_hist_with_line(
+            pensiones_muni,
+            pension_pred,
+            "Distribución de pensión en el municipio",
+            "PENSIÓN",
+        )
+        if chart_pension is not None:
+            col_hist1.altair_chart(chart_pension, use_container_width=True)
+        else:
+            col_hist1.info("No hay datos suficientes para la distribución de pensión.")
+
+        # Distribución de estudiantes en colegios comparables
+        if info["n_colegios_muni_banda"] > 0 and not np.isnan(
+            info["prom_est_muni_banda"]
+        ):
+            est_comp = info["df_filtrado"]["ESTUDIANTES_TOTALES_2023"]
+            chart_est = chart_hist_with_line(
+                est_comp,
+                info["prom_est_muni_banda"],
+                "Distribución de estudiantes (colegios comparables)",
+                "ESTUDIANTES_TOTALES_2023",
+            )
+            if chart_est is not None:
+                col_hist2.altair_chart(chart_est, use_container_width=True)
+            else:
+                col_hist2.info(
+                    "No hay datos suficientes para la distribución de estudiantes."
+                )
+        else:
+            col_hist2.info(
+                "No hay colegios comparables suficientes para graficar estudiantes."
+            )
+
         st.markdown("### Colegios comparables en el municipio")
+
         if info["n_colegios_muni_banda"] == 0:
             st.info(
                 "No se encontraron colegios en ese municipio con pensiones dentro de la banda de 95%."
             )
         else:
-            cols_to_show = [
-                "DEPTO",
-                "MUNI",
-                "PENSIÓN",
-                "ESTUDIANTES_TOTALES_2023",
-                "CALENDARIO",
-                "ES_BILINGUE",
-                "JORNADA",
-            ]
-            cols_to_show = [c for c in cols_to_show if c in info["df_filtrado"].columns]
-            st.dataframe(info["df_filtrado"][cols_to_show].sort_values("PENSIÓN"))
+            df_show = info["df_filtrado"].copy()
+
+            # Reordenar columnas para destacar nombre, DANE, localidad
+            priority = []
+            for col in [NAME_COL, DANE_COL, "DEPTO", "MUNI", "LOCALIDAD",
+                        "PENSIÓN", "ESTUDIANTES_TOTALES_2023"]:
+                if col and col in df_show.columns and col not in priority:
+                    priority.append(col)
+            other_cols = [c for c in df_show.columns if c not in priority]
+            df_show = df_show[priority + other_cols]
+
+            df_show = df_show.sort_values("PENSIÓN")
+            st.dataframe(df_show)
+
+            # Botón para descargar CSV con toda la información
+            csv = df_show.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="Descargar colegios comparables (CSV)",
+                data=csv,
+                file_name="colegios_comparables.csv",
+                mime="text/csv",
+            )
 
 
 if __name__ == "__main__":
