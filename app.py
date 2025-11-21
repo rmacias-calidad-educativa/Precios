@@ -136,10 +136,9 @@ def detectar_nombre_y_dane(df):
 NAME_COL, DANE_COL = detectar_nombre_y_dane(df_base)
 
 # ------------------------------------------------------------------
-# 2. Entrenar modelo de pensión (ensemble) con cache
+# 2. Entrenar modelo de pensión (ensemble) POR DEPARTAMENTO
 # ------------------------------------------------------------------
-@st.cache_resource
-def train_pension_model(df):
+def train_pension_model_core(df):
 
     educativas = educativas_base + [
         "PROM_PUNTAJE_PROMEDIO_AREAS",
@@ -254,14 +253,24 @@ def train_pension_model(df):
             return np.expm1(v) if usar_log else v
 
         groups = df["MUNI"]
-        gkf = GroupKFold(n_splits=5)
+        n_groups = df["MUNI"].nunique()
+
+        # Si hay muy pocos municipios en el departamento, evitamos errores
+        if n_groups >= 2:
+            n_splits = min(5, n_groups)
+            gkf = GroupKFold(n_splits=n_splits)
+            splits = list(gkf.split(X_all, y_raw_all, groups))
+        else:
+            # Sin suficiente variedad de municipios: evaluamos en train (split único)
+            idx_all = np.arange(len(df))
+            splits = [(idx_all, idx_all)]
 
         metricas = {
             nombre: {"r2": [], "mae": [], "rmse": []}
             for nombre in nombres_modelos + ["ensemble"]
         }
 
-        for train_idx, val_idx in gkf.split(X_all, y_raw_all, groups):
+        for train_idx, val_idx in splits:
             X_train = X_all.iloc[train_idx]
             X_val = X_all.iloc[val_idx]
             y_train_raw = y_raw_all[train_idx]
@@ -345,7 +354,7 @@ def train_pension_model(df):
         entrenar_y_evaluar_ensemble_pension(df, usar_log=True, random_state=42)
     )
 
-    # Sigma residual en log(PENSIÓN)
+    # Sigma residual en log(PENSIÓN), usando el ensemble de ese departamento
     X_all = df[feat_pension]
     y_log_real = np.log1p(df["PENSIÓN"].astype(float).values)
 
@@ -362,10 +371,13 @@ def train_pension_model(df):
     return modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension
 
 
-# Entrenamiento global (todos los municipios)
-modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension = (
-    train_pension_model(df_base)
-)
+@st.cache_resource
+def get_pension_model_for_depto(depto: str):
+    """
+    Entrena (y cachea) el modelo de pensión SOLO con los colegios de ese departamento.
+    """
+    df_depto = df_base[df_base["DEPTO"] == depto].copy()
+    return train_pension_model_core(df_depto)
 
 # ------------------------------------------------------------------
 # 3. Funciones auxiliares
@@ -423,7 +435,12 @@ def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
     return df_nueva
 
 
-def predecir_pension_ensemble(df_nueva_proc: pd.DataFrame) -> np.ndarray:
+def predecir_pension_ensemble(
+    df_nueva_proc: pd.DataFrame,
+    modelos_pension,
+    feat_pension,
+    usar_log_pension: bool,
+) -> np.ndarray:
     X_new = df_nueva_proc[feat_pension]
     preds = []
     for _, pipe in modelos_pension.items():
@@ -437,45 +454,66 @@ def predecir_pension_ensemble(df_nueva_proc: pd.DataFrame) -> np.ndarray:
     return matriz.mean(axis=1)
 
 
-# 🔁 NUEVA FUNCIÓN: resumen y comparables SOLO a nivel de municipio (dentro del DEPTO)
 def resumen_estudiantes_por_muni_y_pension(
     depto: str,
     muni: str,
     pension_pred: float,
+    sigma_resid_log: float,
     z: float = 1.96,
 ):
-    # Banda alrededor de la pensión predicha, en log
+    """
+    Calcula bandas de pensión y resúmenes tanto para:
+    - Municipio (dentro del departamento)
+    - Departamento completo
+    """
     log_center = np.log1p(pension_pred)
     low_log = log_center - z * sigma_resid_log
     high_log = log_center + z * sigma_resid_log
     low = np.expm1(low_log)
     high = np.expm1(high_log)
 
-    # Filtro para ese departamento + municipio
+    # Filtros base
+    mask_depto_total = df_base["DEPTO"] == depto
     mask_muni_total = (df_base["DEPTO"] == depto) & (df_base["MUNI"] == muni)
+
+    mask_depto_banda = mask_depto_total & df_base["PENSIÓN"].between(low, high)
     mask_muni_banda = mask_muni_total & df_base["PENSIÓN"].between(low, high)
 
-    df_filtrado = df_base.loc[mask_muni_banda].copy()
+    df_depto_banda = df_base.loc[mask_depto_banda].copy()
+    df_muni_banda = df_base.loc[mask_muni_banda].copy()
 
-    # Promedio de estudiantes en TODO el municipio (independiente de banda)
+    # Promedios estudiantes
+    prom_est_depto_total = df_base.loc[
+        mask_depto_total, "ESTUDIANTES_TOTALES_2023"
+    ].mean()
+
+    prom_est_depto_banda = (
+        df_depto_banda["ESTUDIANTES_TOTALES_2023"].mean()
+        if len(df_depto_banda) > 0
+        else np.nan
+    )
+
     prom_est_muni_total = df_base.loc[
         mask_muni_total, "ESTUDIANTES_TOTALES_2023"
     ].mean()
 
-    # Promedio de estudiantes solo de colegios comparables (misma banda de pensión)
     prom_est_muni_banda = (
-        df_filtrado["ESTUDIANTES_TOTALES_2023"].mean()
-        if len(df_filtrado) > 0
+        df_muni_banda["ESTUDIANTES_TOTALES_2023"].mean()
+        if len(df_muni_banda) > 0
         else np.nan
     )
 
     return {
         "pension_low": low,
         "pension_high": high,
-        "n_colegios_muni_banda": len(df_filtrado),
+        "n_colegios_muni_banda": len(df_muni_banda),
+        "n_colegios_depto_banda": len(df_depto_banda),
         "prom_est_muni_total": prom_est_muni_total,
         "prom_est_muni_banda": prom_est_muni_banda,
-        "df_filtrado": df_filtrado,
+        "prom_est_depto_total": prom_est_depto_total,
+        "prom_est_depto_banda": prom_est_depto_banda,
+        "df_filtrado_muni": df_muni_banda,
+        "df_filtrado_depto": df_depto_banda,
     }
 
 
@@ -509,13 +547,23 @@ def chart_hist_with_line(series, value, title, x_label):
 def main():
     st.title("Simulador de pensión y matrícula esperada")
     st.markdown(
-        "Este visualizador usa un modelo de **pensión** y, a partir de la banda de pensión, "
-        "estima cuántos estudiantes suelen tener colegios similares en el mismo municipio."
+        "Este visualizador entrena un modelo de **pensión por departamento** "
+        "y, a partir de la banda de pensión, estima cuántos estudiantes suelen "
+        "tener colegios similares en el mismo municipio y en el departamento."
     )
 
     # Selección de DEPTO y MUNI
     deptos = sorted(df_base["DEPTO"].dropna().unique())
     depto_sel = st.selectbox("Departamento (DEPTO)", deptos)
+
+    # Modelo específico para ese departamento
+    (
+        modelos_pension_depto,
+        usar_log_pension_depto,
+        feat_pension_depto,
+        sigma_resid_log_depto,
+        resumen_pension_depto,
+    ) = get_pension_model_for_depto(depto_sel)
 
     munis = sorted(
         df_base.loc[df_base["DEPTO"] == depto_sel, "MUNI"].dropna().unique()
@@ -652,18 +700,24 @@ def main():
         )
 
         nueva_proc = preparar_nueva_muestra(nueva_raw)
-        pension_pred = predecir_pension_ensemble(nueva_proc)[0]
+        pension_pred = predecir_pension_ensemble(
+            nueva_proc,
+            modelos_pension_depto,
+            feat_pension_depto,
+            usar_log_pension_depto,
+        )[0]
 
-        # 🔁 Ahora todo el resumen y comparables son SOLO a nivel municipio (dentro del DEPTO)
         info = resumen_estudiantes_por_muni_y_pension(
             depto=depto_sel,
             muni=muni_sel,
             pension_pred=pension_pred,
+            sigma_resid_log=sigma_resid_log_depto,
             z=1.96,
         )
 
+        # Métricas principales
         colA, colB, colC = st.columns(3)
-        colA.metric("Pensión estimada (modelo)", f"${pension_pred:,.0f}")
+        colA.metric("Pensión estimada (modelo por departamento)", f"${pension_pred:,.0f}")
         colB.metric(
             "Rango de pensión similar (95%)",
             f"${info['pension_low']:,.0f}  -  ${info['pension_high']:,.0f}",
@@ -673,61 +727,107 @@ def main():
             f"{info['n_colegios_muni_banda']}",
         )
 
-        colD, colE = st.columns(2)
+        # Métricas municipio vs departamento
+        colD, colE, colF = st.columns(3)
+        if np.isnan(info["prom_est_muni_total"]):
+            muni_total_str = "No hay datos"
+        else:
+            muni_total_str = f"{info['prom_est_muni_total']:.1f}"
+
+        if np.isnan(info["prom_est_muni_banda"]):
+            muni_banda_str = "No hay colegios en la banda"
+        else:
+            muni_banda_str = f"{info['prom_est_muni_banda']:.1f}"
+
+        if np.isnan(info["prom_est_depto_total"]):
+            depto_total_str = "No hay datos"
+        else:
+            depto_total_str = f"{info['prom_est_depto_total']:.1f}"
+
         colD.metric(
             "Prom. estudiantes en el municipio (todos)",
-            f"{info['prom_est_muni_total']:.1f}",
+            muni_total_str,
         )
-        if np.isnan(info["prom_est_muni_banda"]):
-            colE.metric(
-                "Prom. estudiantes (muni, banda pensión)",
-                "No hay colegios en la banda",
-            )
-        else:
-            colE.metric(
-                "Prom. estudiantes (muni, banda pensión)",
-                f"{info['prom_est_muni_banda']:.1f}",
-            )
+        colE.metric(
+            "Prom. estudiantes (municipio, banda pensión)",
+            muni_banda_str,
+        )
+        colF.metric(
+            "Colegios comparables en el departamento",
+            f"{info['n_colegios_depto_banda']}",
+        )
 
-        # Distribución de pensión en el municipio (DEPTO + MUNI)
-        st.markdown("### Distribuciones")
+        colG, colH = st.columns(2)
+        if np.isnan(info["prom_est_depto_banda"]):
+            depto_banda_str = "No hay colegios en la banda"
+        else:
+            depto_banda_str = f"{info['prom_est_depto_banda']:.1f}"
+
+        colG.metric(
+            "Prom. estudiantes en el departamento (todos)",
+            depto_total_str,
+        )
+        colH.metric(
+            "Prom. estudiantes (depto, banda pensión)",
+            depto_banda_str,
+        )
+
+        # Distribuciones
+        st.markdown("### Distribuciones de pensión")
         col_hist1, col_hist2 = st.columns(2)
 
+        # Municipio
         pensiones_muni = df_base.loc[
             (df_base["DEPTO"] == depto_sel) & (df_base["MUNI"] == muni_sel),
             "PENSIÓN",
         ]
-        chart_pension = chart_hist_with_line(
+        chart_pension_muni = chart_hist_with_line(
             pensiones_muni,
             pension_pred,
             "Distribución de pensión en el municipio",
             "PENSIÓN",
         )
-        if chart_pension is not None:
-            col_hist1.altair_chart(chart_pension, use_container_width=True)
+        if chart_pension_muni is not None:
+            col_hist1.altair_chart(chart_pension_muni, use_container_width=True)
         else:
-            col_hist1.info("No hay datos suficientes para la distribución de pensión.")
+            col_hist1.info("No hay datos suficientes para la distribución de pensión en el municipio.")
 
-        # Distribución de estudiantes en colegios comparables (municipio + banda)
+        # Departamento
+        pensiones_depto = df_base.loc[
+            df_base["DEPTO"] == depto_sel, "PENSIÓN"
+        ]
+        chart_pension_depto = chart_hist_with_line(
+            pensiones_depto,
+            pension_pred,
+            "Distribución de pensión en el departamento",
+            "PENSIÓN",
+        )
+        if chart_pension_depto is not None:
+            col_hist2.altair_chart(chart_pension_depto, use_container_width=True)
+        else:
+            col_hist2.info("No hay datos suficientes para la distribución de pensión en el departamento.")
+
+        # Distribución de estudiantes en colegios comparables del municipio
+        st.markdown("### Distribución de estudiantes en colegios comparables (municipio)")
         if info["n_colegios_muni_banda"] > 0 and not np.isnan(
             info["prom_est_muni_banda"]
         ):
-            est_comp = info["df_filtrado"]["ESTUDIANTES_TOTALES_2023"]
-            chart_est = chart_hist_with_line(
-                est_comp,
+            est_comp_muni = info["df_filtrado_muni"]["ESTUDIANTES_TOTALES_2023"]
+            chart_est_muni = chart_hist_with_line(
+                est_comp_muni,
                 info["prom_est_muni_banda"],
-                "Distribución de estudiantes (colegios comparables)",
+                "Distribución de estudiantes (colegios comparables - municipio)",
                 "ESTUDIANTES_TOTALES_2023",
             )
-            if chart_est is not None:
-                col_hist2.altair_chart(chart_est, use_container_width=True)
+            if chart_est_muni is not None:
+                st.altair_chart(chart_est_muni, use_container_width=True)
             else:
-                col_hist2.info(
-                    "No hay datos suficientes para la distribución de estudiantes."
+                st.info(
+                    "No hay datos suficientes para la distribución de estudiantes (municipio)."
                 )
         else:
-            col_hist2.info(
-                "No hay colegios comparables suficientes para graficar estudiantes."
+            st.info(
+                "No hay colegios comparables suficientes en el municipio para graficar estudiantes."
             )
 
         st.markdown("### Colegios comparables en el municipio")
@@ -737,7 +837,7 @@ def main():
                 "No se encontraron colegios en ese municipio con pensiones dentro de la banda de 95%."
             )
         else:
-            df_show = info["df_filtrado"].copy()
+            df_show_muni = info["df_filtrado_muni"].copy()
 
             # Reordenar columnas para destacar nombre, DANE, localidad
             priority = []
@@ -750,20 +850,55 @@ def main():
                 "PENSIÓN",
                 "ESTUDIANTES_TOTALES_2023",
             ]:
-                if col and col in df_show.columns and col not in priority:
+                if col and col in df_show_muni.columns and col not in priority:
                     priority.append(col)
-            other_cols = [c for c in df_show.columns if c not in priority]
-            df_show = df_show[priority + other_cols]
+            other_cols = [c for c in df_show_muni.columns if c not in priority]
+            df_show_muni = df_show_muni[priority + other_cols]
 
-            df_show = df_show.sort_values("PENSIÓN")
-            st.dataframe(df_show)
+            df_show_muni = df_show_muni.sort_values("PENSIÓN")
+            st.dataframe(df_show_muni)
 
-            # Botón para descargar CSV con toda la información
-            csv = df_show.to_csv(index=False).encode("utf-8-sig")
+            csv_muni = df_show_muni.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                label="Descargar colegios comparables (CSV)",
-                data=csv,
-                file_name="colegios_comparables.csv",
+                label="Descargar colegios comparables del municipio (CSV)",
+                data=csv_muni,
+                file_name="colegios_comparables_municipio.csv",
+                mime="text/csv",
+            )
+
+        # Opcional: tabla de comparables a nivel departamento
+        st.markdown("### Colegios comparables en el departamento (misma banda de pensión)")
+
+        if info["n_colegios_depto_banda"] == 0:
+            st.info(
+                "No se encontraron colegios en el departamento con pensiones dentro de la banda de 95%."
+            )
+        else:
+            df_show_depto = info["df_filtrado_depto"].copy()
+
+            priority_dep = []
+            for col in [
+                NAME_COL,
+                DANE_COL,
+                "DEPTO",
+                "MUNI",
+                "LOCALIDAD",
+                "PENSIÓN",
+                "ESTUDIANTES_TOTALES_2023",
+            ]:
+                if col and col in df_show_depto.columns and col not in priority_dep:
+                    priority_dep.append(col)
+            other_cols_dep = [c for c in df_show_depto.columns if c not in priority_dep]
+            df_show_depto = df_show_depto[priority_dep + other_cols_dep]
+
+            df_show_depto = df_show_depto.sort_values(["MUNI", "PENSIÓN"])
+            st.dataframe(df_show_depto)
+
+            csv_depto = df_show_depto.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="Descargar colegios comparables del departamento (CSV)",
+                data=csv_depto,
+                file_name="colegios_comparables_departamento.csv",
                 mime="text/csv",
             )
 
