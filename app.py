@@ -1,40 +1,344 @@
-
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib
 
+from sklearn.model_selection import GroupKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+    ExtraTreesRegressor,
+    BaggingRegressor,
+)
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+# ------------------------------------------------------------------
+# Configuración básica
+# ------------------------------------------------------------------
 BASE_FILE = "251107 Base colegios pricing (1).xlsx"
-MODEL_FILE = "modelo_pension_ensemble_y_banda.joblib"
 
 st.set_page_config(
     page_title="Simulador de pensión y matrícula",
     layout="wide",
 )
 
+# ------------------------------------------------------------------
+# 1. Cargar y preparar la base
+# ------------------------------------------------------------------
 @st.cache_data
-def load_base():
+def load_and_prepare_base():
     df = pd.read_excel(BASE_FILE)
-    return df
 
+    # Ingeniería de variables (igual que en Colab)
+    df["SEGMENTO_GEOGRAFICO"] = np.where(
+        df["LOCALIDAD"].notna(),
+        df["MUNI"].astype(str) + " - " + df["LOCALIDAD"].astype(str),
+        df["MUNI"].astype(str),
+    )
+
+    orden_icfes = {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    df["PLANTEL_ICFES_ORD"] = df["PLANTEL ICFES 2024"].map(orden_icfes)
+
+    umbral_nuevo = 5
+    df["COLEGIO_NUEVO"] = np.where(df["AÑOS DE OPERACIÓN"] <= umbral_nuevo, 1, 0)
+    df["COLEGIO_NUEVO"] = df["COLEGIO_NUEVO"].fillna(0)
+
+    educativas_base = [
+        "PROM. PUNTAJE GLOBAL",
+        "PROM. PUNTAJE INGLÉS",
+        "PROM. PUNTAJE MATEMATICAS",
+        "PROM. PUNTAJE LECTURA CRITICA",
+        "PROM. PUNTAJE SOCIALES CIUDADANAS",
+        "PROM. PUNTAJE CIENCIAS NATURALES",
+    ]
+
+    df["PROM_PUNTAJE_PROMEDIO_AREAS"] = df[
+        [
+            "PROM. PUNTAJE INGLÉS",
+            "PROM. PUNTAJE MATEMATICAS",
+            "PROM. PUNTAJE LECTURA CRITICA",
+            "PROM. PUNTAJE SOCIALES CIUDADANAS",
+            "PROM. PUNTAJE CIENCIAS NATURALES",
+        ]
+    ].mean(axis=1)
+
+    df["PROM_PUNTAJE_STEM"] = df[
+        ["PROM. PUNTAJE MATEMATICAS", "PROM. PUNTAJE CIENCIAS NATURALES"]
+    ].mean(axis=1)
+
+    df["PROM_PUNTAJE_LETRAS"] = df[
+        [
+            "PROM. PUNTAJE LECTURA CRITICA",
+            "PROM. PUNTAJE SOCIALES CIUDADANAS",
+            "PROM. PUNTAJE INGLÉS",
+        ]
+    ].mean(axis=1)
+
+    df["DESVIO_PUNTAJES_AREAS"] = df[
+        [
+            "PROM. PUNTAJE INGLÉS",
+            "PROM. PUNTAJE MATEMATICAS",
+            "PROM. PUNTAJE LECTURA CRITICA",
+            "PROM. PUNTAJE SOCIALES CIUDADANAS",
+            "PROM. PUNTAJE CIENCIAS NATURALES",
+        ]
+    ].std(axis=1)
+
+    df["BRECHA_GLOBAL_AREAS"] = (
+        df["PROM. PUNTAJE GLOBAL"] - df["PROM_PUNTAJE_PROMEDIO_AREAS"]
+    )
+
+    # Guardamos cosas útiles en un dict
+    meta = {
+        "orden_icfes": orden_icfes,
+        "umbral_nuevo": umbral_nuevo,
+        "educativas_base": educativas_base,
+    }
+
+    return df, meta
+
+
+df_base, meta = load_and_prepare_base()
+orden_icfes = meta["orden_icfes"]
+umbral_nuevo = meta["umbral_nuevo"]
+educativas_base = meta["educativas_base"]
+
+# ------------------------------------------------------------------
+# 2. Entrenar modelo de pensión (ensemble) con cache
+# ------------------------------------------------------------------
 @st.cache_resource
-def load_model_bundle():
-    bundle = joblib.load(MODEL_FILE)
-    return bundle
+def train_pension_model(df):
 
-df_base = load_base()
-bundle = load_model_bundle()
+    # Listas de variables (mismo criterio que en Colab)
+    educativas = educativas_base + [
+        "PROM_PUNTAJE_PROMEDIO_AREAS",
+        "PROM_PUNTAJE_STEM",
+        "PROM_PUNTAJE_LETRAS",
+        "DESVIO_PUNTAJES_AREAS",
+        "BRECHA_GLOBAL_AREAS",
+    ]
 
-modelos_pension = bundle["modelos_pension"]
-usar_log_pension = bundle["usar_log_pension"]
-feat_pension = bundle["feat_pension"]
-resumen_pension = bundle["resumen_pension"]
-sigma_resid_log = bundle["sigma_resid_log"]
-orden_icfes = bundle.get("orden_icfes", {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1})
-umbral_nuevo = bundle.get("umbral_nuevo", 5)
+    economicas = [
+        "INSE",
+        "NSE_ ESTABLECIMIENTO",
+        "NSE_ESTUDIANTE",
+    ]
 
+    geograficas = [
+        "DEPTO",
+        "MUNI",
+        "SEGMENTO_GEOGRAFICO",
+        "TIPO DE MUNICIPIO",
+    ]
+
+    otras_categoricas = [
+        "CALENDARIO",
+        "ES_BILINGUE",
+        "JORNADA",
+    ]
+
+    def crear_preprocesador_para_pension():
+        numeric_features = educativas + economicas + [
+            "PLANTEL_ICFES_ORD",
+            "AÑOS DE OPERACIÓN",
+            "COLEGIO_NUEVO",
+            "ESTUDIANTES_TOTALES_2023",
+        ]
+        categorical_features = geograficas + otras_categoricas
+
+        numeric_transformer = Pipeline(
+            steps=[("imputer", SimpleImputer(strategy="median")),
+                   ("scaler", StandardScaler())]
+        )
+        categorical_transformer = Pipeline(
+            steps=[("imputer", SimpleImputer(strategy="most_frequent")),
+                   ("onehot", OneHotEncoder(handle_unknown="ignore"))]
+        )
+
+        pre = ColumnTransformer(
+            transformers=[
+                ("num", numeric_transformer, numeric_features),
+                ("cat", categorical_transformer, categorical_features),
+            ]
+        )
+        feature_cols = numeric_features + categorical_features
+        return pre, feature_cols
+
+    def obtener_modelos_candidatos_pension():
+        modelos = {
+            "rf": lambda rs: RandomForestRegressor(
+                n_estimators=600,
+                max_depth=None,
+                min_samples_leaf=2,
+                n_jobs=-1,
+                random_state=rs,
+            ),
+            "gbrt": lambda rs: GradientBoostingRegressor(
+                n_estimators=400,
+                learning_rate=0.05,
+                max_depth=3,
+                random_state=rs,
+            ),
+            "extratrees": lambda rs: ExtraTreesRegressor(
+                n_estimators=600,
+                max_depth=None,
+                min_samples_leaf=2,
+                n_jobs=-1,
+                random_state=rs,
+            ),
+            "bagging_dt": lambda rs: BaggingRegressor(
+                DecisionTreeRegressor(
+                    max_depth=10,
+                    min_samples_leaf=4,
+                    random_state=rs,
+                ),
+                n_estimators=300,
+                bootstrap=True,
+                n_jobs=-1,
+                random_state=rs,
+            ),
+        }
+        return modelos
+
+    def entrenar_y_evaluar_ensemble_pension(
+        df,
+        usar_log=True,
+        random_state=42,
+    ):
+        modelos_candidatos = obtener_modelos_candidatos_pension()
+        nombres_modelos = list(modelos_candidatos.keys())
+
+        pre0, feature_cols = crear_preprocesador_para_pension()
+        X_all = df[feature_cols].copy()
+        y_raw_all = df["PENSIÓN"].astype(float).values
+
+        def fwd(v):
+            return np.log1p(v) if usar_log else v
+
+        def inv(v):
+            return np.expm1(v) if usar_log else v
+
+        groups = df["MUNI"]
+        gkf = GroupKFold(n_splits=5)
+
+        metricas = {nombre: {"r2": [], "mae": [], "rmse": []}
+                    for nombre in nombres_modelos + ["ensemble"]}
+
+        for train_idx, val_idx in gkf.split(X_all, y_raw_all, groups):
+            X_train = X_all.iloc[train_idx]
+            X_val = X_all.iloc[val_idx]
+            y_train_raw = y_raw_all[train_idx]
+            y_val_raw = y_raw_all[val_idx]
+
+            y_train_tf = fwd(y_train_raw)
+            preds_modelos = {}
+
+            for nombre in nombres_modelos:
+                pre_fold, _ = crear_preprocesador_para_pension()
+                modelo = modelos_candidatos[nombre](random_state)
+
+                pipe = Pipeline(
+                    steps=[
+                        ("preprocess", pre_fold),
+                        ("model", modelo),
+                    ]
+                )
+
+                pipe.fit(X_train, y_train_tf)
+                y_pred_val_tf = pipe.predict(X_val)
+                y_pred_val_raw = inv(y_pred_val_tf)
+                preds_modelos[nombre] = y_pred_val_raw
+
+                r2 = r2_score(y_val_raw, y_pred_val_raw)
+                mae = mean_absolute_error(y_val_raw, y_pred_val_raw)
+                mse = mean_squared_error(y_val_raw, y_pred_val_raw)
+                rmse = np.sqrt(mse)
+
+                metricas[nombre]["r2"].append(r2)
+                metricas[nombre]["mae"].append(mae)
+                metricas[nombre]["rmse"].append(rmse)
+
+            matriz_preds = np.column_stack([preds_modelos[n] for n in nombres_modelos])
+            y_pred_ens_raw = matriz_preds.mean(axis=1)
+
+            r2 = r2_score(y_val_raw, y_pred_ens_raw)
+            mae = mean_absolute_error(y_val_raw, y_pred_ens_raw)
+            mse = mean_squared_error(y_val_raw, y_pred_ens_raw)
+            rmse = np.sqrt(mse)
+
+            metricas["ensemble"]["r2"].append(r2)
+            metricas["ensemble"]["mae"].append(mae)
+            metricas["ensemble"]["rmse"].append(rmse)
+
+        resumen = {}
+        for nombre in nombres_modelos + ["ensemble"]:
+            r2_mean = np.mean(metricas[nombre]["r2"])
+            mae_mean = np.mean(metricas[nombre]["mae"])
+            rmse_mean = np.mean(metricas[nombre]["rmse"])
+            resumen[nombre] = {
+                "r2_mean": r2_mean,
+                "mae_mean": mae_mean,
+                "rmse_mean": rmse_mean,
+            }
+
+        mejor_nombre = max(resumen.keys(), key=lambda n: resumen[n]["r2_mean"])
+        if mejor_nombre == "ensemble":
+            nombres_seleccionados = nombres_modelos
+        else:
+            nombres_seleccionados = [mejor_nombre]
+
+        modelos_finales = {}
+        y_all_tf = fwd(y_raw_all)
+        for nombre in nombres_seleccionados:
+            pre_final, _ = crear_preprocesador_para_pension()
+            modelo_final = modelos_candidatos[nombre](random_state + 999)
+
+            pipe_final = Pipeline(
+                steps=[
+                    ("preprocess", pre_final),
+                    ("model", modelo_final),
+                ]
+            )
+            pipe_final.fit(X_all, y_all_tf)
+            modelos_finales[nombre] = pipe_final
+
+        return modelos_finales, usar_log, feature_cols, resumen
+
+    modelos_pension, usar_log_pension, feat_pension, resumen_pension = (
+        entrenar_y_evaluar_ensemble_pension(df, usar_log=True, random_state=42)
+    )
+
+    # Sigma residual en log(PENSIÓN)
+    X_all = df[feat_pension]
+    y_log_real = np.log1p(df["PENSIÓN"].astype(float).values)
+
+    preds_log = []
+    for _, pipe in modelos_pension.items():
+        y_hat_tf = pipe.predict(X_all)
+        y_hat_log = y_hat_tf  # porque entrenamos en log
+        preds_log.append(y_hat_log)
+
+    y_hat_log_mean = np.column_stack(preds_log).mean(axis=1)
+    resid = y_log_real - y_hat_log_mean
+    sigma_resid_log = resid.std()
+
+    return modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension
+
+
+modelos_pension, usar_log_pension, feat_pension, sigma_resid_log, resumen_pension = train_pension_model(
+    df_base
+)
+
+# ------------------------------------------------------------------
+# 3. Funciones auxiliares de predicción y bandas
+# ------------------------------------------------------------------
 def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
     df_nueva = df_nueva.copy()
+
     df_nueva["SEGMENTO_GEOGRAFICO"] = np.where(
         df_nueva["LOCALIDAD"].notna(),
         df_nueva["MUNI"].astype(str) + " - " + df_nueva["LOCALIDAD"].astype(str),
@@ -45,6 +349,7 @@ def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
         df_nueva["AÑOS DE OPERACIÓN"] <= umbral_nuevo, 1, 0
     )
     df_nueva["COLEGIO_NUEVO"] = df_nueva["COLEGIO_NUEVO"].fillna(0)
+
     df_nueva["PROM_PUNTAJE_PROMEDIO_AREAS"] = df_nueva[
         [
             "PROM. PUNTAJE INGLÉS",
@@ -54,9 +359,11 @@ def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
             "PROM. PUNTAJE CIENCIAS NATURALES",
         ]
     ].mean(axis=1)
+
     df_nueva["PROM_PUNTAJE_STEM"] = df_nueva[
         ["PROM. PUNTAJE MATEMATICAS", "PROM. PUNTAJE CIENCIAS NATURALES"]
     ].mean(axis=1)
+
     df_nueva["PROM_PUNTAJE_LETRAS"] = df_nueva[
         [
             "PROM. PUNTAJE LECTURA CRITICA",
@@ -64,6 +371,7 @@ def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
             "PROM. PUNTAJE INGLÉS",
         ]
     ].mean(axis=1)
+
     df_nueva["DESVIO_PUNTAJES_AREAS"] = df_nueva[
         [
             "PROM. PUNTAJE INGLÉS",
@@ -73,10 +381,13 @@ def preparar_nueva_muestra(df_nueva: pd.DataFrame) -> pd.DataFrame:
             "PROM. PUNTAJE CIENCIAS NATURALES",
         ]
     ].std(axis=1)
+
     df_nueva["BRECHA_GLOBAL_AREAS"] = (
         df_nueva["PROM. PUNTAJE GLOBAL"] - df_nueva["PROM_PUNTAJE_PROMEDIO_AREAS"]
     )
+
     return df_nueva
+
 
 def predecir_pension_ensemble(df_nueva_proc: pd.DataFrame) -> np.ndarray:
     X_new = df_nueva_proc[feat_pension]
@@ -90,6 +401,7 @@ def predecir_pension_ensemble(df_nueva_proc: pd.DataFrame) -> np.ndarray:
         preds.append(y_hat_raw)
     matriz = np.column_stack(preds)
     return matriz.mean(axis=1)
+
 
 def resumen_estudiantes_por_depto_y_pension(
     depto: str,
@@ -127,6 +439,9 @@ def resumen_estudiantes_por_depto_y_pension(
         "df_filtrado": df_filtrado,
     }
 
+# ------------------------------------------------------------------
+# 4. Interfaz Streamlit
+# ------------------------------------------------------------------
 def main():
     st.title("Simulador de pensión y matrícula esperada")
     st.markdown(
@@ -156,16 +471,20 @@ def main():
         jornada_sel = st.selectbox("Jornada", jornadas)
 
     with col2:
-        anos_oper = st.number_input("Años de operación", min_value=0, max_value=50, value=5)
+        anos_oper = st.number_input("Años de operación",
+                                    min_value=0, max_value=50, value=5)
         icfes_sel = st.selectbox("Plantel ICFES 2024", icfes_opts)
-        inse = st.number_input("INSE", value=float(df_base["INSE"].mean(skipna=True)))
+        inse = st.number_input("INSE",
+                               value=float(df_base["INSE"].mean(skipna=True)))
         nse_estab = st.number_input(
-            "NSE establecimiento", value=float(df_base["NSE_ ESTABLECIMIENTO"].mean(skipna=True))
+            "NSE establecimiento",
+            value=float(df_base["NSE_ ESTABLECIMIENTO"].mean(skipna=True)),
         )
 
     with col3:
         nse_estud = st.number_input(
-            "NSE estudiante", value=float(df_base["NSE_ESTUDIANTE"].mean(skipna=True))
+            "NSE estudiante",
+            value=float(df_base["NSE_ESTUDIANTE"].mean(skipna=True)),
         )
         est_tot = st.number_input(
             "Estudiantes totales estimados",
@@ -178,6 +497,7 @@ def main():
 
     st.subheader("Resultados Saber 11 (promedios)")
     col4, col5, col6 = st.columns(3)
+
     with col4:
         p_global = st.number_input(
             "PROM. PUNTAJE GLOBAL",
@@ -297,6 +617,7 @@ def main():
             ]
             cols_to_show = [c for c in cols_to_show if c in info["df_filtrado"].columns]
             st.dataframe(info["df_filtrado"][cols_to_show].sort_values("PENSIÓN"))
+
 
 if __name__ == "__main__":
     main()
